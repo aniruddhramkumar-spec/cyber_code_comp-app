@@ -8,6 +8,9 @@ import re
 import secrets
 import hashlib
 import logging
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 from functools import wraps
 
@@ -19,7 +22,9 @@ from config import (
     PASSWORD_MIN_LENGTH, PASSWORD_MAX_LENGTH, PASSWORD_REQUIRE_UPPERCASE,
     PASSWORD_REQUIRE_LOWERCASE, PASSWORD_REQUIRE_NUMBERS, PASSWORD_REQUIRE_SPECIAL,
     USERNAME_MIN_LENGTH, USERNAME_MAX_LENGTH, USERNAME_PATTERN,
-    SESSION_TIMEOUT, MAX_LOGIN_ATTEMPTS, ENCRYPTION_KEY_FILE, MFA_ISSUER, APP_NAME
+    SESSION_TIMEOUT, MAX_LOGIN_ATTEMPTS, ENCRYPTION_KEY_FILE, MFA_ISSUER, APP_NAME,
+    EMAIL_HOST, EMAIL_PORT, EMAIL_USERNAME, EMAIL_PASSWORD, EMAIL_FROM,
+    EMAIL_USE_TLS, EMAIL_CODE_EXPIRY
 )
 
 logger = logging.getLogger(__name__)
@@ -488,6 +493,77 @@ def get_security_headers() -> dict:
     }
 
 
+# ============================================================================
+# EMAIL MFA FUNCTIONS
+# ============================================================================
+
+def generate_email_code() -> str:
+    """
+    Generate a 6-character alphanumeric code for email MFA.
+    
+    Returns:
+        6-character code
+    """
+    return secrets.token_hex(3).upper()  # 6 characters
+
+
+def send_email_mfa_code(email: str, code: str, username: str) -> bool:
+    """
+    Send MFA verification code via email.
+    
+    Args:
+        email: Recipient email address
+        code: Verification code
+        username: Username for personalization
+        
+    Returns:
+        True if email sent successfully
+    """
+    try:
+        # Create message
+        msg = MIMEMultipart()
+        msg['From'] = EMAIL_FROM
+        msg['To'] = email
+        msg['Subject'] = f"{APP_NAME} - Your MFA Code"
+        
+        # Email body
+        body = f"""
+Hello {username},
+
+Your Multi-Factor Authentication code for {APP_NAME} is:
+
+{code}
+
+This code will expire in 5 minutes. Please enter it to complete your login.
+
+If you did not request this code, please ignore this email.
+
+Best regards,
+{APP_NAME} Security Team
+"""
+        
+        msg.attach(MIMEText(body, 'plain'))
+        
+        # Send email
+        server = smtplib.SMTP(EMAIL_HOST, EMAIL_PORT)
+        if EMAIL_USE_TLS:
+            server.starttls()
+        
+        if EMAIL_USERNAME and EMAIL_PASSWORD:
+            server.login(EMAIL_USERNAME, EMAIL_PASSWORD)
+        
+        text = msg.as_string()
+        server.sendmail(EMAIL_FROM, email, text)
+        server.quit()
+        
+        logger.info(f"MFA email sent to {email} for user {username}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to send MFA email to {email}: {e}")
+        return False
+
+
 __all__ = [
     'setup_encryption_key', 'encrypt_data', 'decrypt_data',
     'hash_password', 'verify_password', 'validate_password_strength',
@@ -496,5 +572,6 @@ __all__ = [
     'sanitize_input', 'validate_and_sanitize',
     'generate_session_token', 'create_session_id',
     'log_security_event', 'is_session_expired', 'get_security_headers',
-    'SESSION_TIMEOUT', 'MAX_LOGIN_ATTEMPTS'
+    'SESSION_TIMEOUT', 'MAX_LOGIN_ATTEMPTS', 'generate_email_code',
+    'send_email_mfa_code'
 ]

@@ -66,6 +66,7 @@ A **production-grade, enterprise-secure data visualization platform** built with
 
 ---
 
+
 ## 🚀 Installation & Setup
 
 ### **Prerequisites**
@@ -85,11 +86,45 @@ source venv/bin/activate  # Windows: venv\Scripts\activate
 # 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. Run application
+# 4. Configure Email for MFA (Optional but recommended)
+cp .env.example .env
+# Edit .env file with your email credentials (see below)
+
+# 5. Run application
 streamlit run streamlit_app.py
 ```
 
 The app will open at `http://localhost:8501`
+
+---
+
+## 📧 Email Configuration for MFA
+
+For email-based MFA to work, you need to configure email credentials:
+
+### **Gmail Setup**
+
+2. **Generate an App Password**:
+   - Go to [Google Account Settings](https://myaccount.google.com/)
+   - Security → 2-Step Verification → App passwords
+   - Generate password for "Mail"
+3. **Edit `.env` file**:
+   ```bash
+   EMAIL_USERNAME=your-gmail@gmail.com
+   EMAIL_PASSWORD=your-16-character-app-password
+   EMAIL_FROM=your-gmail@gmail.com
+   ```
+
+### **Other Email Providers**
+Update the `.env` file with your SMTP settings:
+```bash
+EMAIL_HOST=your-smtp-server.com
+EMAIL_PORT=587  # or 465 for SSL
+EMAIL_USERNAME=your-email@provider.com
+EMAIL_PASSWORD=your-password
+EMAIL_FROM=your-email@provider.com
+EMAIL_USE_TLS=true  # or false for SSL
+```
 
 ---
 

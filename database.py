@@ -40,6 +40,7 @@ def init_db():
                 email TEXT UNIQUE NOT NULL,
                 full_name TEXT,
                 mfa_enabled BOOLEAN DEFAULT 0,
+                mfa_type TEXT DEFAULT 'totp',  -- 'totp' or 'email'
                 mfa_secret TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -99,12 +100,28 @@ def init_db():
             )
         """)
         
+        # Email verification codes for MFA
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS email_verification_codes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                code TEXT NOT NULL,
+                purpose TEXT NOT NULL,  -- 'mfa_login', 'mfa_setup', etc.
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NOT NULL,
+                used BOOLEAN DEFAULT 0,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        
         # Create indexes for better performance and query optimization
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_graphs_user_id ON graphs(user_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_user_id ON audit_log(user_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_graphs_type ON graphs(graph_type)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_email_codes_user_id ON email_verification_codes(user_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_email_codes_expires ON email_verification_codes(expires_at)")
         
         conn.commit()
         logger.info("Database initialized successfully")
@@ -393,14 +410,15 @@ def delete_graph(graph_id: int, user_id: int) -> bool:
 # AUTHENTICATION FUNCTIONS
 # ============================================================================
 
-def update_user_mfa(user_id: int, mfa_secret: str, enabled: bool = True) -> bool:
+def update_user_mfa(user_id: int, mfa_secret: str = None, enabled: bool = True, mfa_type: str = 'totp') -> bool:
     """
     Update MFA settings for user (OWASP A07 - Authentication Failures).
     
     Args:
         user_id: User ID
-        mfa_secret: TOTP secret
+        mfa_secret: TOTP secret or None for email MFA
         enabled: Enable or disable MFA
+        mfa_type: 'totp' or 'email'
         
     Returns:
         True if successful
@@ -410,12 +428,12 @@ def update_user_mfa(user_id: int, mfa_secret: str, enabled: bool = True) -> bool
     
     try:
         cursor.execute(
-            """UPDATE users SET mfa_enabled = ?, mfa_secret = ?, updated_at = CURRENT_TIMESTAMP
+            """UPDATE users SET mfa_enabled = ?, mfa_type = ?, mfa_secret = ?, updated_at = CURRENT_TIMESTAMP
                WHERE id = ?""",
-            (enabled, mfa_secret if enabled else None, user_id)
+            (enabled, mfa_type, mfa_secret if enabled else None, user_id)
         )
         conn.commit()
-        log_audit("mfa_updated", user_id, "User", user_id, f"MFA enabled: {enabled}")
+        log_audit("mfa_updated", user_id, "User", user_id, f"MFA enabled: {enabled}, type: {mfa_type}")
         return cursor.rowcount > 0
     except Exception as e:
         logger.error(f"MFA update error: {e}")
@@ -720,6 +738,103 @@ def get_audit_log(user_id: Optional[int] = None, limit: int = 100) -> List[Dict]
         conn.close()
 
 
+# ============================================================================
+# EMAIL VERIFICATION FUNCTIONS
+# ============================================================================
+
+def create_email_verification_code(user_id: int, code: str, purpose: str, expiry_seconds: int = 300) -> bool:
+    """
+    Create an email verification code for MFA.
+    
+    Args:
+        user_id: User ID
+        code: Verification code
+        purpose: Purpose ('mfa_login', 'mfa_setup', etc.)
+        expiry_seconds: Code expiry time in seconds
+        
+    Returns:
+        True if successful
+    """
+    from datetime import datetime, timedelta
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        expires_at = datetime.utcnow() + timedelta(seconds=expiry_seconds)
+        cursor.execute(
+            """INSERT INTO email_verification_codes (user_id, code, purpose, expires_at) 
+               VALUES (?, ?, ?, ?)""",
+            (user_id, code, purpose, expires_at)
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Email verification code creation error: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def verify_email_code(user_id: int, code: str, purpose: str) -> bool:
+    """
+    Verify an email verification code.
+    
+    Args:
+        user_id: User ID
+        code: Code to verify
+        purpose: Expected purpose
+        
+    Returns:
+        True if code is valid and not expired
+    """
+    from datetime import datetime
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute(
+            """SELECT id FROM email_verification_codes 
+               WHERE user_id = ? AND code = ? AND purpose = ? AND used = 0 
+               AND expires_at > ? LIMIT 1""",
+            (user_id, code, purpose, datetime.utcnow())
+        )
+        
+        result = cursor.fetchone()
+        if result:
+            # Mark code as used
+            cursor.execute(
+                "UPDATE email_verification_codes SET used = 1 WHERE id = ?",
+                (result['id'],)
+            )
+            conn.commit()
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Email code verification error: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def cleanup_expired_codes() -> None:
+    """Clean up expired email verification codes."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute(
+            "DELETE FROM email_verification_codes WHERE expires_at < ?",
+            (datetime.utcnow(),)
+        )
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Cleanup expired codes error: {e}")
+    finally:
+        conn.close()
+
+
 __all__ = [
     'init_db', 'get_db_connection', 'create_user', 'get_user_by_username', 
     'get_user_by_id', 'user_exists', 'save_graph', 'update_graph',
@@ -727,5 +842,6 @@ __all__ = [
     'update_password', 'update_last_login', 'increment_failed_login',
     'reset_failed_login', 'lock_account', 'is_account_locked',
     'create_session', 'get_session', 'delete_session', 'update_session_activity',
-    'log_audit', 'get_audit_log'
+    'log_audit', 'get_audit_log', 'create_email_verification_code',
+    'verify_email_code', 'cleanup_expired_codes'
 ]

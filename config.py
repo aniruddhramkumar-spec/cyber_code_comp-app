@@ -5,6 +5,10 @@ Centralized configuration management with security best practices.
 
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Application metadata
 APP_NAME = "ChartVault"
@@ -30,6 +34,15 @@ PASSWORD_REQUIRE_SPECIAL = True
 # MFA Configuration
 MFA_ISSUER = "ChartVault"
 MFA_WINDOW = 1  # Number of windows to check for TOTP
+
+# Email Configuration for MFA
+EMAIL_HOST = os.getenv("EMAIL_HOST", "smtp.gmail.com")
+EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
+EMAIL_USERNAME = os.getenv("EMAIL_USERNAME", "")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "")
+EMAIL_FROM = os.getenv("EMAIL_FROM", "noreply@chartvault.com")
+EMAIL_USE_TLS = True
+EMAIL_CODE_EXPIRY = 300  # 5 minutes in seconds
 
 # Encryption
 ENCRYPTION_ALGORITHM = "AES-256-GCM"
@@ -86,11 +99,14 @@ COLORS = {
     "warning": "#F59E0B",      # Amber
     "danger": "#EF4444",       # Red
     "info": "#0EA5E9",         # Sky blue
-    "light_bg": "#F8FAFC",     # Light gray-blue
+    "light_bg": "#FFB366",     # Pale scarlet orange background
+    "sidebar_bg": "#FFB366",   # Pale scarlet orange background
+    "card_bg": "#FFB366",      # Pale scarlet orange background
+    "tab_bg": "#FFB366",       # Pale scarlet orange background
     "dark_bg": "#0F172A",      # Dark navy
     "border": "#E2E8F0",       # Light border
     "text_primary": "#1E293B", # Dark text
-    "text_secondary": "#64748B" # Medium gray text
+    "text_secondary": "#A7F3D0" # Pale green text
 }
 
 # UI Settings

@@ -27,14 +27,16 @@ from database import (
     user_exists, save_graph, update_graph, get_user_graphs, get_graph,
     delete_graph, update_user_mfa, update_password, update_last_login,
     increment_failed_login, reset_failed_login, lock_account, is_account_locked,
-    create_session, get_session, delete_session, update_session_activity, log_audit
+    create_session, get_session, delete_session, update_session_activity, log_audit,
+    create_email_verification_code, verify_email_code, cleanup_expired_codes
 )
 from security import (
     setup_encryption_key, hash_password, verify_password,
     generate_mfa_secret, verify_totp, sanitize_input,
     validate_password_strength, validate_username, SESSION_TIMEOUT,
     MAX_LOGIN_ATTEMPTS, get_totp, get_mfa_provisioning_uri,
-    encrypt_data, decrypt_data, log_security_event, create_session_id
+    encrypt_data, decrypt_data, log_security_event, create_session_id,
+    generate_email_code, send_email_mfa_code
 )
 from validators import (
     validate_chart_title, validate_axis_label, validate_graph_name,
@@ -98,18 +100,29 @@ st.markdown(f"""
     /* Main container */
     .main {{
         background-color: {COLORS['light_bg']};
+        font-family: 'Courier New', Courier, monospace !important;
+    }}
+    
+    /* Global Courier typewriter-style font for all text */
+    html, body, * {{
+        font-family: 'Courier New', Courier, monospace !important;
+    }}
+    
+    /* Dashboard specific background */
+    .dashboard-bg {{
+        background-color: #87CEEB !important; /* Light cornflower blue */
     }}
     
     /* Sidebar styling */
     [data-testid="stSidebar"] {{
-        background-color: white;
+        background-color: {COLORS['sidebar_bg']};
         border-right: 2px solid {COLORS['border']};
     }}
     
     /* Header styling */
     .header {{
-        background: linear-gradient(135deg, {COLORS['primary']} 0%, {COLORS['secondary']} 100%);
-        color: white;
+        background: #F0E6FF !important; /* Pale lavender */
+        color: #4B0082; /* Dark purple text for contrast */
         padding: 30px;
         border-radius: 10px;
         margin-bottom: 30px;
@@ -129,9 +142,39 @@ st.markdown(f"""
         opacity: 0.95;
     }}
     
+    /* Login page header styling - dark green text */
+    .login-header {{
+        background: #F0E6FF !important; /* Pale lavender */
+        color: #006400 !important; /* Dark green text */
+    }}
+    
+    .login-header h1 {{
+        color: #006400 !important; /* Dark green for title */
+    }}
+    
+    .login-header p {{
+        color: #006400 !important; /* Dark green for subtitle */
+        opacity: 0.8 !important;
+    }}
+    
+    /* Account page header styling - deep brown background with light cream text */
+    .account-header {{
+        background: #654321 !important; /* Deep brown */
+        color: #F5DEB3 !important; /* Light cream text */
+    }}
+    
+    .account-header h1 {{
+        color: #F5DEB3 !important; /* Light cream for title */
+    }}
+    
+    .account-header p {{
+        color: #F5DEB3 !important; /* Light cream for subtitle */
+        opacity: 0.8 !important;
+    }}
+    
     /* Card styling */
     .card {{
-        background: white;
+        background: {COLORS['card_bg']};
         border-radius: 12px;
         padding: 25px;
         border: 1px solid {COLORS['border']};
@@ -188,32 +231,32 @@ st.markdown(f"""
     }}
     
     .success {{
-        background-color: #ECFDF5;
+        background-color: #FFE5CC;
         border-left: 4px solid {COLORS['success']};
         color: #065F46;
     }}
     
     .error {{
-        background-color: #FEF2F2;
+        background-color: #FFCC99;
         border-left: 4px solid {COLORS['danger']};
         color: #7F1D1D;
     }}
     
     .warning {{
-        background-color: #FFFBEB;
+        background-color: #FFD4A3;
         border-left: 4px solid {COLORS['warning']};
         color: #78350F;
     }}
     
     .info {{
-        background-color: #EFF6FF;
+        background-color: #FFE0B2;
         border-left: 4px solid {COLORS['info']};
         color: #0C2340;
     }}
     
     /* Tab styling */
     .stTabs {{
-        background-color: white;
+        background-color: {COLORS['tab_bg']};
         border-radius: 12px;
         padding: 20px;
         border: 1px solid {COLORS['border']};
@@ -243,19 +286,19 @@ st.markdown(f"""
     }}
     
     .badge.success {{
-        background-color: #ECFDF5;
+        background-color: #FFE5CC;
         color: {COLORS['success']};
         border-color: {COLORS['success']};
     }}
     
     .badge.warning {{
-        background-color: #FFFBEB;
+        background-color: #FFD4A3;
         color: {COLORS['warning']};
         border-color: {COLORS['warning']};
     }}
     
     .badge.danger {{
-        background-color: #FEF2F2;
+        background-color: #FFCC99;
         color: {COLORS['danger']};
         border-color: {COLORS['danger']};
     }}
@@ -402,9 +445,15 @@ def login_user(username: str, password: str, mfa_code: str = None) -> tuple[bool
             if not mfa_code:
                 return False, "mfa_required"
             
-            if not verify_totp(user['mfa_secret'], mfa_code):
-                log_security_event("mfa_failed", username, "Invalid MFA code")
-                return False, "Invalid MFA code"
+            mfa_type = user.get('mfa_type', 'totp')
+            if mfa_type == 'email':
+                if not verify_email_code(user['id'], mfa_code, 'mfa_login'):
+                    log_security_event("mfa_failed", username, "Invalid email MFA code")
+                    return False, "Invalid MFA code"
+            else:  # totp
+                if not verify_totp(user['mfa_secret'], mfa_code):
+                    log_security_event("mfa_failed", username, "Invalid TOTP MFA code")
+                    return False, "Invalid MFA code"
         
         # Successful login
         reset_failed_login(user['id'])
@@ -420,6 +469,7 @@ def login_user(username: str, password: str, mfa_code: str = None) -> tuple[bool
         ss.username = username
         ss.session_id = session_id
         ss.mfa_enabled = user['mfa_enabled']
+        ss.mfa_type = user.get('mfa_type', 'totp')
         ss.last_activity = datetime.utcnow()
         ss.current_page = 'dashboard'
         
@@ -447,6 +497,7 @@ def logout():
     ss.username = None
     ss.session_id = None
     ss.mfa_enabled = False
+    ss.mfa_type = None
     ss.current_page = 'login'
     ss.selected_graph_id = None
 
@@ -458,14 +509,32 @@ def setup_mfa():
         st.error("User not found")
         return
     
-    if not ss.mfa_secret_temp:
-        ss.mfa_secret_temp = generate_mfa_secret(ss.username)
-    
     st.info("🔐 Multi-Factor Authentication Setup")
     st.write("""
     Multi-factor authentication adds an extra layer of security to your account.
-    You'll need to enter a code from an authenticator app to log in.
+    Choose your preferred method below.
     """)
+    
+    # Choose MFA type
+    mfa_type = st.radio(
+        "Select MFA Method:",
+        ["TOTP (Authenticator App)", "Email"],
+        key="mfa_type_radio",
+        help="TOTP uses an authenticator app, Email sends codes to your email address"
+    )
+    
+    if mfa_type == "TOTP (Authenticator App)":
+        setup_totp_mfa(user)
+    else:
+        setup_email_mfa(user)
+
+
+def setup_totp_mfa(user):
+    """Setup TOTP MFA."""
+    if not ss.mfa_secret_temp:
+        ss.mfa_secret_temp = generate_mfa_secret(ss.username)
+    
+    st.write("**TOTP Setup:** Use an authenticator app like Google Authenticator or Authy.")
     
     # Display QR code
     provisioning_uri = get_mfa_provisioning_uri(ss.username, ss.mfa_secret_temp)
@@ -473,14 +542,14 @@ def setup_mfa():
     qr.add_data(provisioning_uri)
     qr.make(fit=True)
     
-    img = qr.make_image(fill_color="black", back_color="white")
+    img = qr.make_image(fill_color="black", back_color=COLORS["light_bg"])
     buf = BytesIO()
     img.save(buf, format="PNG")
     buf.seek(0)
     
     col1, col2 = st.columns(2)
     with col1:
-        st.image(buf, caption="Scan with authenticator app (Google Authenticator, Authy, etc.)", width=300)
+        st.image(buf, caption="Scan with authenticator app", width=300)
     
     with col2:
         st.write("**Or enter this code manually:**")
@@ -489,21 +558,59 @@ def setup_mfa():
     # Verify MFA code
     st.divider()
     st.write("**Verify your authenticator app:**")
-    mfa_code = st.text_input("Enter 6-digit code from app:", max_chars=6, type="password")
+    mfa_code = st.text_input("Enter 6-digit code from app:", max_chars=6, type="password", key="totp_code")
     
-    if st.button("✓ Confirm MFA Setup", use_container_width=True):
+    if st.button("✓ Confirm TOTP Setup", use_container_width=True):
         if not mfa_code or len(mfa_code) != 6:
             st.error("Please enter a valid 6-digit code")
         elif verify_totp(ss.mfa_secret_temp, mfa_code):
             # Save MFA secret
-            update_user_mfa(ss.user_id, ss.mfa_secret_temp, True)
+            update_user_mfa(ss.user_id, ss.mfa_secret_temp, True, 'totp')
             ss.mfa_enabled = True
             ss.mfa_secret_temp = None
-            log_security_event("mfa_enabled", ss.username, "MFA enabled for account")
-            st.success("✓ MFA setup complete! Your account is now more secure.")
+            log_security_event("mfa_enabled", ss.username, "TOTP MFA enabled for account")
+            st.success("✓ TOTP MFA setup complete! Your account is now more secure.")
             st.rerun()
         else:
             st.error("Invalid code. Please try again.")
+
+
+def setup_email_mfa(user):
+    """Setup Email MFA."""
+    st.write("**Email Setup:** We'll send verification codes to your email address.")
+    st.write(f"**Email:** {user['email']}")
+    
+    if st.button("📧 Send Test Code", use_container_width=True):
+        # Generate and send test code
+        code = generate_email_code()
+        if create_email_verification_code(ss.user_id, code, 'mfa_setup'):
+            if send_email_mfa_code(user['email'], code, ss.username):
+                st.success("Test code sent! Check your email.")
+                ss.email_test_sent = True
+                st.rerun()
+            else:
+                st.error("Failed to send email. Please check your email configuration.")
+        else:
+            st.error("Failed to generate verification code.")
+    
+    if ss.email_test_sent:
+        st.divider()
+        st.write("**Verify your email:**")
+        mfa_code = st.text_input("Enter 6-character code from email:", max_chars=6, type="password", key="email_code")
+        
+        if st.button("✓ Confirm Email MFA Setup", use_container_width=True):
+            if not mfa_code or len(mfa_code) != 6:
+                st.error("Please enter a valid 6-character code")
+            elif verify_email_code(ss.user_id, mfa_code, 'mfa_setup'):
+                # Enable email MFA (no secret needed)
+                update_user_mfa(ss.user_id, None, True, 'email')
+                ss.mfa_enabled = True
+                ss.email_test_sent = False
+                log_security_event("mfa_enabled", ss.username, "Email MFA enabled for account")
+                st.success("✓ Email MFA setup complete! Your account is now more secure.")
+                st.rerun()
+            else:
+                st.error("Invalid code. Please try again.")
 
 
 # ============================================================================
@@ -648,7 +755,7 @@ def create_and_save_graph(graph_type: str, graph_name: str, title: str,
 def page_login():
     """Login/Register page."""
     st.markdown(f"""
-    <div class="header">
+    <div class="header login-header">
         <h1>📊 {APP_NAME}</h1>
         <p>Secure Data Visualization Platform</p>
     </div>
@@ -688,18 +795,38 @@ def page_login():
         # MFA code entry if needed
         if ss.get('mfa_required', False):
             st.divider()
-            st.info("🔐 Enter your MFA code from your authenticator app:")
-            with st.form("mfa_form"):
-                mfa_code = st.text_input("6-digit code", max_chars=6, type="password")
-                if st.form_submit_button("✓ Verify MFA", use_container_width=True):
-                    success, message = login_user(ss.username_temp, ss.password_temp, mfa_code)
-                    if success:
-                        st.success(message)
-                        st.balloons()
-                        ss['mfa_required'] = False
-                        st.rerun()
+            user = get_user_by_username(ss.username_temp)
+            mfa_type = user.get('mfa_type', 'totp') if user else 'totp'
+            
+            if mfa_type == 'email':
+                st.info("🔐 We've sent a 6-character code to your email. Enter it below:")
+                if not ss.get('mfa_email_sent', False):
+                    # Send email code
+                    code = generate_email_code()
+                    if create_email_verification_code(user['id'], code, 'mfa_login'):
+                        if send_email_mfa_code(user['email'], code, ss.username_temp):
+                            ss.mfa_email_sent = True
+                            st.success("Code sent to your email!")
+                        else:
+                            st.error("Failed to send email. Please try logging in again.")
                     else:
-                        st.error(message)
+                        st.error("Failed to generate verification code.")
+                
+                code_input = st.text_input("6-character code", max_chars=6, type="password", key="mfa_code")
+            else:
+                st.info("🔐 Enter your 6-digit code from your authenticator app:")
+                code_input = st.text_input("6-digit code", max_chars=6, type="password", key="mfa_code")
+            
+            if st.button("✓ Verify MFA", use_container_width=True):
+                success, message = login_user(ss.username_temp, ss.password_temp, code_input)
+                if success:
+                    st.success(message)
+                    st.balloons()
+                    ss['mfa_required'] = False
+                    ss.mfa_email_sent = False
+                    st.rerun()
+                else:
+                    st.error(message)
     
     with tab2:
         st.subheader("Create a New Account")
@@ -729,6 +856,159 @@ def page_dashboard():
     """Main dashboard page with graph management."""
     check_session_expiry()
     
+    # Apply dashboard-specific background with higher specificity
+    st.markdown("""
+    <style>
+        /* Dashboard background colors */
+        body { background-color: #87CEEB !important; }
+        .main { background-color: #87CEEB !important; }
+        [data-testid="stAppViewContainer"] { background-color: #87CEEB !important; }
+        [data-testid="stSidebar"] { background-color: #87CEEB !important; }
+        .card { background-color: #A4D4F0 !important; }
+        .stTabs { background-color: #A4D4F0 !important; }
+        div[data-testid="stVerticalBlock"] { background-color: #87CEEB !important; }
+        
+        /* Dashboard container styling - pale light lavender */
+        .stContainer, [data-testid="stContainer"] {
+            background-color: #F0E6FF !important;
+            border-radius: 8px !important;
+        }
+        
+        /* More specific targeting for containers with borders */
+        div[data-testid="stVerticalBlock"] .stContainer {
+            background-color: #F0E6FF !important;
+        }
+        
+        /* Target any container-like elements in the dashboard */
+        [data-testid="stAppViewContainer"] .stContainer {
+            background-color: #F0E6FF !important;
+        }
+        
+        /* Also target the inner content areas */
+        [data-testid="stAppViewContainer"] .stContainer > div {
+            background-color: #F0E6FF !important;
+        }
+        
+        /* Force override any default container backgrounds */
+        [data-testid="stAppViewContainer"] [data-testid*="container"] {
+            background-color: #F0E6FF !important;
+        }
+        
+        /* Target elements that might have the blue background */
+        [data-testid="stAppViewContainer"] div[style*="background-color"] {
+            background-color: #F0E6FF !important;
+        }
+        
+        /* Dashboard button styling - light coral */
+        [data-testid="stAppViewContainer"] .stButton > button {
+            background: #F08080 !important; /* Light coral */
+            color: white !important;
+            border: none !important;
+            border-radius: 8px !important;
+            padding: 12px 24px !important;
+            font-weight: 600 !important;
+            font-size: 1em !important;
+            transition: all 0.3s ease !important;
+            width: 100% !important;
+        }
+        
+        [data-testid="stAppViewContainer"] .stButton > button:hover {
+            background: #FF7F7F !important; /* Slightly lighter coral on hover */
+            transform: translateY(-2px) !important;
+            box-shadow: 0 4px 12px rgba(240, 128, 128, 0.4) !important;
+        }
+        
+        /* Account page specific styling - deep brown background ONLY for empty white spaces */
+        /* Target the main container background only */
+        [data-testid="stAppViewContainer"]:has(.account-header) {
+            background-color: #654321 !important; /* Deep brown for white background spaces */
+        }
+        
+        /* Keep boxes, containers, and buttons with their original styling - DO NOT CHANGE */
+        [data-testid="stAppViewContainer"]:has(.account-header) .stContainer,
+        [data-testid="stAppViewContainer"]:has(.account-header) [data-testid*="stContainer"],
+        [data-testid="stAppViewContainer"]:has(.account-header) .stForm,
+        [data-testid="stAppViewContainer"]:has(.account-header) .stButton {
+            /* Keep original styling - don't override */
+        }
+        
+        /* Account page text colors - light cream for visibility on deep brown background */
+        [data-testid="stAppViewContainer"]:has(.account-header) p {
+            color: #F5DEB3 !important; /* Light cream for readability on brown */
+        }
+        
+        [data-testid="stAppViewContainer"]:has(.account-header) span {
+            color: #F5DEB3 !important; /* Light cream */
+        }
+        
+        /* Account page subheaders - light cream */
+        [data-testid="stAppViewContainer"]:has(.account-header) h2,
+        [data-testid="stAppViewContainer"]:has(.account-header) h3,
+        [data-testid="stAppViewContainer"]:has(.account-header) h4,
+        [data-testid="stAppViewContainer"]:has(.account-header) h5,
+        [data-testid="stAppViewContainer"]:has(.account-header) h6 {
+            color: #F5DEB3 !important;
+        }
+        
+        /* Account page dividers and other elements */
+        [data-testid="stAppViewContainer"]:has(.account-header) .stCaption {
+            color: #006400 !important;
+        }
+        
+        /* Dashboard text colors - ultra specific selectors */
+        div[data-testid="stAppViewContainer"] p:not([class*="header"]):not([class*="st-"]):not([data-testid]) { color: #8B4513 !important; }
+        div[data-testid="stAppViewContainer"] span:not([class*="header"]):not([class*="st-"]) { color: #8B4513 !important; }
+        div[data-testid="stAppViewContainer"] div:not([class*="header"]):not([class*="card"]):not([class*="st-"]):not([data-testid]) { color: #8B4513 !important; }
+        
+        /* Headings - maroon */
+        div[data-testid="stAppViewContainer"] h1:not([class*="st-"]) { color: #800000 !important; }
+        div[data-testid="stAppViewContainer"] h2:not([class*="st-"]) { color: #800000 !important; }
+        div[data-testid="stAppViewContainer"] h3:not([class*="st-"]) { color: #800000 !important; }
+        div[data-testid="stAppViewContainer"] h4:not([class*="st-"]) { color: #800000 !important; }
+        div[data-testid="stAppViewContainer"] h5:not([class*="st-"]) { color: #800000 !important; }
+        div[data-testid="stAppViewContainer"] h6:not([class*="st-"]) { color: #800000 !important; }
+        
+        /* Button text specifically */
+        .stButton > button:not([disabled]) { color: #8B4513 !important; }
+        .stButton > button:not([disabled]) * { color: #8B4513 !important; }
+        
+        /* Captions and small text */
+        .stCaption, .stCaption * { color: #8B4513 !important; }
+        
+        /* Info messages */
+        .stInfo, .stInfo * { color: #8B4513 !important; }
+    </style>
+    
+    <script>
+        // Apply text colors after page load to override Streamlit defaults
+        setTimeout(function() {
+            // Regular text - dark caramel
+            const textElements = document.querySelectorAll('div[data-testid="stAppViewContainer"] p, div[data-testid="stAppViewContainer"] span, div[data-testid="stAppViewContainer"] div');
+            textElements.forEach(el => {
+                if (!el.closest('.header') && !el.closest('.st-') && !el.hasAttribute('data-testid') && !el.closest('button')) {
+                    el.style.color = '#8B4513';
+                }
+            });
+            
+            // Headings - maroon
+            const headingElements = document.querySelectorAll('div[data-testid="stAppViewContainer"] h1, div[data-testid="stAppViewContainer"] h2, div[data-testid="stAppViewContainer"] h3, div[data-testid="stAppViewContainer"] h4, div[data-testid="stAppViewContainer"] h5, div[data-testid="stAppViewContainer"] h6');
+            headingElements.forEach(el => {
+                if (!el.closest('.st-')) {
+                    el.style.color = '#800000';
+                }
+            });
+            
+            // Button text
+            const buttons = document.querySelectorAll('.stButton > button');
+            buttons.forEach(btn => {
+                if (!btn.disabled) {
+                    btn.style.color = '#8B4513';
+                }
+            });
+        }, 1000);
+    </script>
+    """, unsafe_allow_html=True)
+    
     st.markdown(f"""
     <div class="header">
         <h1>📊 Welcome, {ss.username}!</h1>
@@ -736,7 +1016,7 @@ def page_dashboard():
     </div>
     """, unsafe_allow_html=True)
     
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3 = st.columns(3)
     
     with col1:
         if st.button("➕ New Graph", use_container_width=True, key="btn_new"):
@@ -744,16 +1024,11 @@ def page_dashboard():
             st.rerun()
     
     with col2:
-        if st.button("⚙️ Settings", use_container_width=True, key="btn_settings"):
-            ss.current_page = "settings"
-            st.rerun()
-    
-    with col3:
         if st.button("📋 Account", use_container_width=True, key="btn_account"):
             ss.current_page = "account"
             st.rerun()
     
-    with col4:
+    with col3:
         if st.button("🚪 Logout", use_container_width=True, key="btn_logout"):
             logout()
             st.rerun()
@@ -980,12 +1255,20 @@ def page_settings():
         st.subheader("2FA / MFA Settings")
         
         if ss.mfa_enabled:
-            st.success("✓ Multi-Factor Authentication is enabled")
-            if st.button("Disable MFA", key="disable_mfa"):
-                update_user_mfa(ss.user_id, None, False)
-                ss.mfa_enabled = False
-                st.success("MFA disabled")
-                st.rerun()
+            mfa_type_display = "Email" if ss.get('mfa_type') == 'email' else "Authenticator App (TOTP)"
+            st.success(f"✓ Multi-Factor Authentication is enabled ({mfa_type_display})")
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Disable MFA", key="disable_mfa"):
+                    update_user_mfa(ss.user_id, None, False)
+                    ss.mfa_enabled = False
+                    ss.mfa_type = None
+                    st.success("MFA disabled")
+                    st.rerun()
+            with col2:
+                if st.button("Change MFA Method", key="change_mfa"):
+                    ss.current_page = "setup_mfa"
+                    st.rerun()
         else:
             st.warning("⚠️ Multi-Factor Authentication is not enabled")
             st.info("Enable MFA for enhanced security.")
@@ -1002,7 +1285,7 @@ def page_account():
     check_session_expiry()
     
     st.markdown(f"""
-    <div class="header">
+    <div class="header account-header">
         <h1>👤 Account Information</h1>
         <p>View and manage your account</p>
     </div>
@@ -1069,8 +1352,8 @@ def page_setup_mfa():
     </div>
     """, unsafe_allow_html=True)
     
-    if st.button("← Back to Settings"):
-        ss.current_page = "settings"
+    if st.button("← Back to Dashboard"):
+        ss.current_page = "dashboard"
         ss.mfa_secret_temp = None
         st.rerun()
     
@@ -1095,8 +1378,6 @@ def main():
         page_create_graph()
     elif ss.current_page == "view_graph":
         page_view_graph()
-    elif ss.current_page == "settings":
-        page_settings()
     elif ss.current_page == "account":
         page_account()
     elif ss.current_page == "setup_mfa":
